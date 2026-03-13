@@ -380,6 +380,46 @@ describe("CLI Status Command", () => {
     // Should show collection info
     expect(stdout).toContain("Collection");
   });
+
+  test("status reflects llm provider config from YAML at startup", async () => {
+    const env = await createIsolatedTestEnv("status-llm");
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      [
+        "llm:",
+        "  embedding:",
+        "    provider: remote",
+        "    model: Qwen/Qwen3-Embedding-0.6B",
+        "    api_endpoint: https://example.com/v1/embeddings",
+        "    api_key: sk-embed",
+        "  reranking:",
+        "    provider: remote",
+        "    model: Qwen/Qwen3-Reranker-0.6B",
+        "    api_endpoint: https://example.com/v1/rerank",
+        "    api_key: sk-rerank",
+        "  expansion:",
+        "    provider: remote",
+        "    model: Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "    api_endpoint: https://example.com/v1/chat/completions",
+        "    api_key: sk-expand",
+        "collections:",
+        "  docs:",
+        `    path: ${fixturesDir}`,
+        "    pattern: '**/*.md'",
+        "",
+      ].join("\n")
+    );
+
+    const { stdout, exitCode } = await runQmd(["status"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("remote Qwen/Qwen3-Embedding-0.6B");
+    expect(stdout).toContain("remote Qwen/Qwen3-Reranker-0.6B");
+    expect(stdout).toContain("remote Qwen/Qwen3-Coder-30B-A3B-Instruct");
+    expect(stdout).toContain("remote-only");
+  });
 });
 
 describe("CLI Search Command", () => {

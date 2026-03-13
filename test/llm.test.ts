@@ -15,6 +15,7 @@ import {
   withLLMSession,
   canUnloadLLM,
   SessionReleasedError,
+  DEFAULT_EMBED_MODEL_URI,
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
@@ -114,6 +115,262 @@ describe("LlamaCpp expand context size config", () => {
     expect(() => new LlamaCpp({ expandContextSize: 0 })).toThrow(
       "Invalid expandContextSize: 0. Must be a positive integer."
     );
+  });
+});
+
+describe("LlamaCpp provider config", () => {
+  test("defaults all capabilities to local when llm config is omitted", () => {
+    const llm = new LlamaCpp({}) as any;
+    expect(llm.capabilityConfig.embedding.provider).toBe("local");
+    expect(llm.capabilityConfig.reranking.provider).toBe("local");
+    expect(llm.capabilityConfig.expansion.provider).toBe("local");
+    expect(llm.capabilityConfig.expansion.enableHyde).toBe(true);
+  });
+
+  test("ignores QMD_EMBED_MODEL environment variable", async () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    try {
+      await disposeDefaultLlamaCpp();
+      const llm = getDefaultLlamaCpp();
+      expect(llm.getEmbeddingModel()).toBe(DEFAULT_EMBED_MODEL_URI);
+    } finally {
+      await disposeDefaultLlamaCpp();
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
+  test("throws for unknown provider", () => {
+    expect(() => new LlamaCpp({
+      llmConfig: {
+        embedding: {
+          provider: "weird" as any,
+        },
+      },
+    })).toThrow('Invalid embedding provider: weird');
+  });
+
+  test("throws when remote embedding config is incomplete", () => {
+    expect(() => new LlamaCpp({
+      llmConfig: {
+        embedding: {
+          provider: "remote",
+          api_endpoint: "https://example.com/v1/embeddings",
+          api_key: "sk-test",
+        },
+      },
+    })).toThrow("Remote embedding config requires model");
+  });
+
+  test("throws when remote reranking config is incomplete", () => {
+    expect(() => new LlamaCpp({
+      llmConfig: {
+        reranking: {
+          provider: "remote",
+          model: "Qwen/Qwen3-Reranker-0.6B",
+          api_key: "sk-test",
+        },
+      },
+    })).toThrow("Remote reranking config requires api_endpoint");
+  });
+
+  test("throws when remote expansion config is incomplete", () => {
+    expect(() => new LlamaCpp({
+      llmConfig: {
+        expansion: {
+          provider: "remote",
+          model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+          api_endpoint: "https://example.com/v1/chat/completions",
+        },
+      },
+    })).toThrow("Remote expansion config requires api_key");
+  });
+
+  test("defaults expansion enableHyde to true", () => {
+    const llm = new LlamaCpp({
+      llmConfig: {
+        expansion: {
+          provider: "remote",
+          model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+          api_endpoint: "https://example.com/v1/chat/completions",
+          api_key: "sk-test",
+        },
+      },
+    }) as any;
+    expect(llm.capabilityConfig.expansion.enableHyde).toBe(true);
+  });
+});
+
+describe("LlamaCpp remote embed", () => {
+  test("calls configured embeddings endpoint for embedBatch", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        data: [
+          { index: 0, embedding: [0.1, 0.2] },
+          { index: 1, embedding: [0.3, 0.4] },
+        ],
+      }),
+    } as Response);
+
+    try {
+      const llm = new LlamaCpp({
+        llmConfig: {
+          embedding: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Embedding-0.6B",
+            api_endpoint: "https://example.com/v1/embeddings",
+            api_key: "sk-embed",
+          },
+        },
+      });
+
+      const result = await llm.embedBatch(["first", "second"]);
+      expect(result.map(item => item?.embedding)).toEqual([[0.1, 0.2], [0.3, 0.4]]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0]!;
+      expect(url).toBe("https://example.com/v1/embeddings");
+      expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer sk-embed");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        model: "Qwen/Qwen3-Embedding-0.6B",
+        input: ["first", "second"],
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe("LlamaCpp remote rerank", () => {
+  test("calls configured rerank endpoint and maps results back to files", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        results: [
+          { index: 1, relevance_score: 0.9 },
+          { index: 0, relevance_score: 0.2 },
+        ],
+      }),
+    } as Response);
+
+    try {
+      const llm = new LlamaCpp({
+        llmConfig: {
+          reranking: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Reranker-0.6B",
+            api_endpoint: "https://example.com/v1/rerank",
+            api_key: "sk-rerank",
+          },
+        },
+      });
+
+      const result = await llm.rerank("dragon", [
+        { file: "a.md", text: "first" },
+        { file: "b.md", text: "second" },
+      ]);
+
+      expect(result.results).toEqual([
+        { file: "b.md", score: 0.9, index: 1 },
+        { file: "a.md", score: 0.2, index: 0 },
+      ]);
+      const [url, init] = fetchSpy.mock.calls[0]!;
+      expect(url).toBe("https://example.com/v1/rerank");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        model: "Qwen/Qwen3-Reranker-0.6B",
+        query: "dragon",
+        documents: ["first", "second"],
+        top_n: 2,
+        return_documents: false,
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe("LlamaCpp remote expansion", () => {
+  test("calls configured chat completions endpoint and parses lex/vec/hyde lines", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "lex: 龙虾市场\nvec: 龙虾养殖\nhyde: 关于龙虾行业的综述",
+            },
+          },
+        ],
+      }),
+    } as Response);
+
+    try {
+      const llm = new LlamaCpp({
+        llmConfig: {
+          expansion: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            api_endpoint: "https://example.com/v1/chat/completions",
+            api_key: "sk-expand",
+          },
+        },
+      });
+
+      const result = await llm.expandQuery("龙虾");
+      expect(result).toEqual([
+        { type: "lex", text: "龙虾市场" },
+        { type: "vec", text: "龙虾养殖" },
+        { type: "hyde", text: "关于龙虾行业的综述" },
+      ]);
+      const [url, init] = fetchSpy.mock.calls[0]!;
+      expect(url).toBe("https://example.com/v1/chat/completions");
+      const body = JSON.parse(String(init?.body));
+      expect(body.model).toBe("Qwen/Qwen3-Coder-30B-A3B-Instruct");
+      expect(body.messages).toHaveLength(2);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test("omits hyde output when expansion enable_hyde is false", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      text: async () => JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "lex: 龙虾市场\nvec: 龙虾养殖\nhyde: 不应该出现",
+            },
+          },
+        ],
+      }),
+    } as Response);
+
+    try {
+      const llm = new LlamaCpp({
+        llmConfig: {
+          expansion: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            api_endpoint: "https://example.com/v1/chat/completions",
+            api_key: "sk-expand",
+            enable_hyde: false,
+          },
+        },
+      });
+
+      const result = await llm.expandQuery("龙虾");
+      expect(result).toEqual([
+        { type: "lex", text: "龙虾市场" },
+        { type: "vec", text: "龙虾养殖" },
+      ]);
+      const [, init] = fetchSpy.mock.calls[0]!;
+      const body = JSON.parse(String(init?.body));
+      expect(JSON.stringify(body.messages)).not.toContain("hyde");
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
 

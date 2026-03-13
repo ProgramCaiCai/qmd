@@ -77,6 +77,9 @@ import {
   setGlobalContext as collectionsSetGlobalContext,
   type Collection,
   type CollectionConfig,
+  type LLMConfig,
+  type LLMCapabilityConfig,
+  type LLMProvider,
   type NamedCollection,
   type ContextMap,
 } from "./collections.js";
@@ -101,6 +104,9 @@ export type {
   EmbedResult,
   Collection,
   CollectionConfig,
+  LLMConfig,
+  LLMCapabilityConfig,
+  LLMProvider,
   NamedCollection,
   ContextMap,
 };
@@ -344,16 +350,18 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
+  let loadedConfig: CollectionConfig | undefined;
 
   // Sync config into SQLite store_collections
   if (options.configPath) {
     // YAML mode: inject config source for write-through, sync to DB
     setConfigSource({ configPath: options.configPath });
-    const config = loadConfig();
-    syncConfigToDb(db, config);
+    loadedConfig = loadConfig();
+    syncConfigToDb(db, loadedConfig);
   } else if (options.config) {
     // Inline config mode: inject config source for mutations, sync to DB
     setConfigSource({ config: options.config });
+    loadedConfig = options.config;
     syncConfigToDb(db, options.config);
   }
   // else: DB-only mode — no external config, use existing store_collections
@@ -361,6 +369,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
   const llm = new LlamaCpp({
+    llmConfig: loadedConfig?.llm,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
@@ -405,7 +414,12 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, DEFAULT_EMBED_MODEL, opts?.limit, opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(
+      q,
+      internal.llm?.getEmbeddingModel() || DEFAULT_EMBED_MODEL,
+      opts?.limit,
+      opts?.collection
+    ),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {

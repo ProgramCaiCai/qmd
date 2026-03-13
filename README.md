@@ -494,15 +494,20 @@ Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
 
 ### Custom Embedding Model
 
-Override the default embedding model via the `QMD_EMBED_MODEL` environment variable.
+Configure the embedding model in `~/.config/qmd/index.yml`.
 This is useful for multilingual corpora (e.g. Chinese, Japanese, Korean) where
 `embeddinggemma-300M` has limited coverage.
 
-```sh
-# Use Qwen3-Embedding-0.6B for better multilingual (CJK) support
-export QMD_EMBED_MODEL="hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"
+```yaml
+llm:
+  embedding:
+    provider: local
+    model: hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
+```
 
-# After changing the model, re-embed all collections:
+After changing the embedding model, re-run:
+
+```sh
 qmd embed -f
 ```
 
@@ -513,6 +518,68 @@ Supported model families:
 > **Note:** When switching embedding models, you must re-index with `qmd embed -f`
 > since vectors are not cross-compatible between models. The prompt format is
 > automatically adjusted for each model family.
+
+## LLM Provider Configuration
+
+By default, QMD keeps the current fully-managed local behavior:
+
+- local embeddings
+- local reranking
+- local query expansion
+- local GGUF model download and cache management
+
+You only need configuration if you want to switch one or more capabilities to a remote endpoint.
+
+Add an optional `llm:` block to `~/.config/qmd/index.yml`:
+
+```yaml
+llm:
+  embedding:
+    provider: remote
+    model: Qwen/Qwen3-Embedding-0.6B
+    api_endpoint: https://your-endpoint/v1/embeddings
+    api_key: ${EMBEDDING_API_KEY}
+
+  reranking:
+    provider: remote
+    model: Qwen/Qwen3-Reranker-0.6B
+    api_endpoint: https://your-endpoint/v1/rerank
+    api_key: ${RERANK_API_KEY}
+
+  expansion:
+    provider: remote
+    model: Qwen/Qwen3-Coder-30B-A3B-Instruct
+    api_endpoint: https://your-endpoint/v1/chat/completions
+    api_key: ${EXPANSION_API_KEY}
+    enable_hyde: false
+```
+
+Local models can also be configured explicitly with the original HuggingFace URI format:
+
+```yaml
+llm:
+  embedding:
+    provider: local
+    model: hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf
+
+  reranking:
+    provider: local
+    model: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+
+  expansion:
+    provider: local
+    model: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+    enable_hyde: true
+```
+
+Notes:
+
+- Each capability can be configured independently.
+- Remote mode is endpoint-compatible, not vendor-specific.
+- Local mode accepts the same HuggingFace model URIs that QMD already used before this change.
+- `model`, `api_endpoint`, and `api_key` are specified per capability.
+- `expansion.enable_hyde: false` disables HyDE generation while keeping `lex` and `vec` expansion.
+- If you change the embedding model, re-run `qmd embed -f`.
 
 ## Installation
 
@@ -853,7 +920,7 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
 
 ## Model Configuration
 
-Models are configured in `src/llm.ts` as HuggingFace URIs:
+Default local models are configured in `src/llm.ts` as HuggingFace URIs:
 
 ```typescript
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";

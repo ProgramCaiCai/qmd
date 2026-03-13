@@ -17,6 +17,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import type { LLMConfig, LLMCapabilityConfig, LLMProvider } from "./collections.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -36,7 +37,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? DEFAULT_EMBED_MODEL;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -49,7 +50,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  * Qwen3-Embedding encodes documents as raw text without special prefixes.
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
-  const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
+  const uri = modelUri ?? DEFAULT_EMBED_MODEL;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -186,14 +187,29 @@ export type RerankDocument = {
   title?: string;
 };
 
+type CapabilityKind = "embedding" | "reranking" | "expansion";
+
+type NormalizedCapabilityConfig = {
+  provider: LLMProvider;
+  model: string;
+  apiEndpoint?: string;
+  apiKey?: string;
+  enableHyde: boolean;
+};
+
+export type NormalizedLLMConfig = {
+  embedding: NormalizedCapabilityConfig;
+  reranking: NormalizedCapabilityConfig;
+  expansion: NormalizedCapabilityConfig;
+};
+
 // =============================================================================
 // Model Configuration
 // =============================================================================
 
 // HuggingFace model URIs for node-llama-cpp
 // Format: hf:<user>/<repo>/<file>
-// Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
-const DEFAULT_EMBED_MODEL = process.env.QMD_EMBED_MODEL ?? "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
@@ -353,6 +369,7 @@ export type LlamaCppConfig = {
   embedModel?: string;
   generateModel?: string;
   rerankModel?: string;
+  llmConfig?: LLMConfig;
   modelCacheDir?: string;
   /**
    * Context size used for query expansion generation contexts.
@@ -375,6 +392,78 @@ export type LlamaCppConfig = {
    */
   disposeModelsOnInactivity?: boolean;
 };
+
+function resolveConfigValue(value?: string): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  const envMatch = trimmed.match(/^\$\{([A-Z0-9_]+)\}$/i);
+  if (!envMatch) return trimmed;
+  return process.env[envMatch[1]!] || "";
+}
+
+function normalizeCapabilityConfig(
+  kind: CapabilityKind,
+  config: LLMCapabilityConfig | undefined,
+  fallbackModel: string,
+): NormalizedCapabilityConfig {
+  const provider = config?.provider ?? "local";
+  if (provider !== "local" && provider !== "remote") {
+    throw new Error(`Invalid ${kind} provider: ${provider}`);
+  }
+
+  const enableHyde = kind === "expansion" ? (config?.enable_hyde ?? true) : true;
+
+  if (provider === "local") {
+    return {
+      provider,
+      model: config?.model?.trim() || fallbackModel,
+      enableHyde,
+    };
+  }
+
+  const model = config?.model?.trim();
+  const apiEndpoint = resolveConfigValue(config?.api_endpoint);
+  const apiKey = resolveConfigValue(config?.api_key);
+  if (!model) throw new Error(`Remote ${kind} config requires model`);
+  if (!apiEndpoint) throw new Error(`Remote ${kind} config requires api_endpoint`);
+  if (!apiKey) throw new Error(`Remote ${kind} config requires api_key`);
+
+  return {
+    provider,
+    model,
+    apiEndpoint,
+    apiKey,
+    enableHyde,
+  };
+}
+
+function normalizeLLMConfig(config?: LLMConfig, defaults?: {
+  embedModel?: string;
+  generateModel?: string;
+  rerankModel?: string;
+}): NormalizedLLMConfig {
+  return {
+    embedding: normalizeCapabilityConfig("embedding", config?.embedding, defaults?.embedModel || DEFAULT_EMBED_MODEL),
+    reranking: normalizeCapabilityConfig("reranking", config?.reranking, defaults?.rerankModel || DEFAULT_RERANK_MODEL),
+    expansion: normalizeCapabilityConfig("expansion", config?.expansion, defaults?.generateModel || DEFAULT_GENERATE_MODEL),
+  };
+}
+
+async function parseJsonResponse(response: Response): Promise<any> {
+  const text = await response.text();
+  let json: any;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Invalid JSON response (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  if (!response.ok) {
+    const message = json?.error?.message || json?.message || text;
+    throw new Error(`Remote LLM request failed (${response.status}): ${message}`);
+  }
+  return json;
+}
 
 /**
  * LLM implementation using node-llama-cpp
@@ -431,16 +520,34 @@ export class LlamaCpp implements LLM {
 
   // Track disposal state to prevent double-dispose
   private disposed = false;
+  readonly capabilityConfig: NormalizedLLMConfig;
 
 
   constructor(config: LlamaCppConfig = {}) {
-    this.embedModelUri = config.embedModel || DEFAULT_EMBED_MODEL;
-    this.generateModelUri = config.generateModel || DEFAULT_GENERATE_MODEL;
-    this.rerankModelUri = config.rerankModel || DEFAULT_RERANK_MODEL;
+    this.capabilityConfig = normalizeLLMConfig(config.llmConfig, config);
+    this.embedModelUri = this.capabilityConfig.embedding.model;
+    this.generateModelUri = this.capabilityConfig.expansion.model;
+    this.rerankModelUri = this.capabilityConfig.reranking.model;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
     this.disposeModelsOnInactivity = config.disposeModelsOnInactivity ?? false;
+  }
+
+  getEmbeddingModel(): string {
+    return this.capabilityConfig.embedding.model;
+  }
+
+  getRerankModel(): string {
+    return this.capabilityConfig.reranking.model;
+  }
+
+  getExpansionModel(): string {
+    return this.capabilityConfig.expansion.model;
+  }
+
+  getProviderInfo(): NormalizedLLMConfig {
+    return this.capabilityConfig;
   }
 
   /**
@@ -569,6 +676,22 @@ export class LlamaCpp implements LLM {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
     return await resolveModelFile(modelUri, this.modelCacheDir);
+  }
+
+  private hasLocalEmbeddingTokenizer(): boolean {
+    return this.capabilityConfig.embedding.provider === "local";
+  }
+
+  private async remotePost(config: NormalizedCapabilityConfig, body: object): Promise<any> {
+    const response = await fetch(config.apiEndpoint!, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.apiKey!}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return await parseJsonResponse(response);
   }
 
   /**
@@ -802,6 +925,9 @@ export class LlamaCpp implements LLM {
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
   async tokenize(text: string): Promise<readonly LlamaToken[]> {
+    if (!this.hasLocalEmbeddingTokenizer()) {
+      return Array.from(text) as unknown as readonly LlamaToken[];
+    }
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -821,6 +947,9 @@ export class LlamaCpp implements LLM {
    * Detokenize token IDs back to text
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    if (!this.hasLocalEmbeddingTokenizer()) {
+      return Array.from(tokens as readonly unknown[]).map(token => String(token)).join("");
+    }
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -837,6 +966,18 @@ export class LlamaCpp implements LLM {
     this.touchActivity();
 
     try {
+      if (this.capabilityConfig.embedding.provider === "remote") {
+        const config = this.capabilityConfig.embedding;
+        const model = options.model || config.model;
+        const json = await this.remotePost(config, {
+          model,
+          input: text,
+        });
+        const embedding = json?.data?.[0]?.embedding;
+        if (!Array.isArray(embedding)) return null;
+        return { embedding, model };
+      }
+
       const context = await this.ensureEmbedContext();
       const embedding = await context.getEmbeddingFor(text);
 
@@ -862,6 +1003,21 @@ export class LlamaCpp implements LLM {
     if (texts.length === 0) return [];
 
     try {
+      if (this.capabilityConfig.embedding.provider === "remote") {
+        const config = this.capabilityConfig.embedding;
+        const json = await this.remotePost(config, {
+          model: config.model,
+          input: texts,
+        });
+        const byIndex = new Map<number, EmbeddingResult>();
+        for (const item of (json?.data ?? [])) {
+          if (typeof item?.index === "number" && Array.isArray(item?.embedding)) {
+            byIndex.set(item.index, { embedding: item.embedding, model: config.model });
+          }
+        }
+        return texts.map((_, index) => byIndex.get(index) ?? null);
+      }
+
       const contexts = await this.ensureEmbedContexts();
       const n = contexts.length;
 
@@ -978,11 +1134,85 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
-    const llama = await this.ensureLlama();
-    await this.ensureGenerateModel();
-
     const includeLexical = options.includeLexical ?? true;
     const context = options.context;
+    const enableHyde = this.capabilityConfig.expansion.enableHyde;
+
+    const parseExpansionLines = (content: string): Queryable[] => {
+      const lines = content.trim().split("\n");
+      const queryLower = query.toLowerCase();
+      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+
+      const hasQueryTerm = (text: string): boolean => {
+        const lower = text.toLowerCase();
+        if (queryTerms.length === 0) return true;
+        return queryTerms.some(term => lower.includes(term));
+      };
+
+      const queryables: Queryable[] = lines.map(line => {
+        const colonIdx = line.indexOf(":");
+        if (colonIdx === -1) return null;
+        const type = line.slice(0, colonIdx).trim();
+        if (type !== "lex" && type !== "vec" && type !== "hyde") return null;
+        if (type === "hyde" && !enableHyde) return null;
+        const text = line.slice(colonIdx + 1).trim();
+        if (!text || !hasQueryTerm(text)) return null;
+        return { type: type as QueryType, text };
+      }).filter((q): q is Queryable => q !== null);
+
+      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== "lex");
+      return filtered;
+    };
+
+    const fallback = (): Queryable[] => {
+      const base: Queryable[] = [];
+      if (includeLexical) base.push({ type: "lex", text: query });
+      base.push({ type: "vec", text: query });
+      if (enableHyde) base.push({ type: "hyde", text: `Information about ${query}` });
+      return base;
+    };
+
+    if (this.capabilityConfig.expansion.provider === "remote") {
+      try {
+        const json = await this.remotePost(this.capabilityConfig.expansion, {
+          model: this.capabilityConfig.expansion.model,
+          temperature: 0,
+          max_tokens: 256,
+          messages: [
+            {
+              role: "system",
+              content: [
+                "You expand search queries into line-based search variants.",
+                "Return plain text only.",
+                enableHyde
+                  ? "Each line must be exactly one of: lex: ..., vec: ..., hyde: ..."
+                  : "Each line must be exactly one of: lex: ... or vec: ...",
+                includeLexical ? "Include at least one lex line." : "Do not emit lex lines.",
+                enableHyde ? "You may include a single hyde line." : "",
+                "Preserve the user's language.",
+                "No markdown. No explanations.",
+              ].join(" "),
+            },
+            {
+              role: "user",
+              content: options.intent
+                ? `Query: ${query}\nIntent: ${options.intent}`
+                : `Query: ${query}`,
+            },
+          ],
+        });
+        const content = json?.choices?.[0]?.message?.content;
+        if (typeof content !== "string") return fallback();
+        const parsed = parseExpansionLines(content);
+        return parsed.length > 0 ? parsed : fallback();
+      } catch (error) {
+        console.error("Structured query expansion failed:", error);
+        return fallback();
+      }
+    }
+
+    const llama = await this.ensureLlama();
+    await this.ensureGenerateModel();
 
     const grammar = await llama.createGrammar({
       grammar: `
@@ -994,9 +1224,13 @@ export class LlamaCpp implements LLM {
     });
 
     const intent = options.intent;
-    const prompt = intent
-      ? `/no_think Expand this search query: ${query}\nQuery intent: ${intent}`
-      : `/no_think Expand this search query: ${query}`;
+    const promptParts = [
+      `/no_think Expand this search query: ${query}`,
+      intent ? `Query intent: ${intent}` : "",
+      includeLexical ? "Include lexical variants." : "Do not include lexical variants.",
+      enableHyde ? "You may include one hyde variant." : "Do not include hyde variants.",
+    ].filter(Boolean);
+    const prompt = promptParts.join("\n");
 
     // Create a bounded context for expansion to prevent large default VRAM allocations.
     const genContext = await this.generateModel!.createContext({
@@ -1021,42 +1255,12 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
-      if (filtered.length > 0) return filtered;
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      const parsed = parseExpansionLines(result);
+      if (parsed.length > 0) return parsed;
+      return fallback();
     } catch (error) {
       console.error("Structured query expansion failed:", error);
-      // Fallback to original query
-      const fallback: Queryable[] = [{ type: 'vec', text: query }];
-      if (includeLexical) fallback.unshift({ type: 'lex', text: query });
-      return fallback;
+      return fallback();
     } finally {
       await genContext.dispose();
     }
@@ -1075,30 +1279,33 @@ export class LlamaCpp implements LLM {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
-    const contexts = await this.ensureRerankContexts();
-    const model = await this.ensureRerankModel();
+    const configuredModel = options.model || this.capabilityConfig.reranking.model;
+    let truncatedDocs = documents;
 
-    // Truncate documents that would exceed the rerank context size.
-    // Budget = contextSize - template overhead - query tokens
-    const queryTokens = model.tokenize(query).length;
-    const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
-    const truncationCache = new Map<string, string>();
+    if (this.capabilityConfig.reranking.provider === "local") {
+      const model = await this.ensureRerankModel();
+      // Truncate documents that would exceed the rerank context size.
+      // Budget = contextSize - template overhead - query tokens
+      const queryTokens = model.tokenize(query).length;
+      const maxDocTokens = LlamaCpp.RERANK_CONTEXT_SIZE - LlamaCpp.RERANK_TEMPLATE_OVERHEAD - queryTokens;
+      const truncationCache = new Map<string, string>();
 
-    const truncatedDocs = documents.map((doc) => {
-      const cached = truncationCache.get(doc.text);
-      if (cached !== undefined) {
-        return cached === doc.text ? doc : { ...doc, text: cached };
-      }
+      truncatedDocs = documents.map((doc) => {
+        const cached = truncationCache.get(doc.text);
+        if (cached !== undefined) {
+          return cached === doc.text ? doc : { ...doc, text: cached };
+        }
 
-      const tokens = model.tokenize(doc.text);
-      const truncatedText = tokens.length <= maxDocTokens
-        ? doc.text
-        : model.detokenize(tokens.slice(0, maxDocTokens));
-      truncationCache.set(doc.text, truncatedText);
+        const tokens = model.tokenize(doc.text);
+        const truncatedText = tokens.length <= maxDocTokens
+          ? doc.text
+          : model.detokenize(tokens.slice(0, maxDocTokens));
+        truncationCache.set(doc.text, truncatedText);
 
-      if (truncatedText === doc.text) return doc;
-      return { ...doc, text: truncatedText };
-    });
+        if (truncatedText === doc.text) return doc;
+        return { ...doc, text: truncatedText };
+      });
+    }
 
     // Deduplicate identical effective texts before scoring.
     // This avoids redundant work for repeated chunks and fixes collisions where
@@ -1116,28 +1323,47 @@ export class LlamaCpp implements LLM {
     // Extract just the text for ranking
     const texts = Array.from(textToDocs.keys());
 
-    // Split documents across contexts for parallel evaluation.
-    // Each context has its own sequence with a lock, so parallelism comes
-    // from multiple contexts evaluating different chunks simultaneously.
-    const activeContextCount = Math.max(
-      1,
-      Math.min(
-        contexts.length,
-        Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
-      )
-    );
-    const activeContexts = contexts.slice(0, activeContextCount);
-    const chunkSize = Math.ceil(texts.length / activeContexts.length);
-    const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
-      texts.slice(i * chunkSize, (i + 1) * chunkSize)
-    ).filter(chunk => chunk.length > 0);
+    let flatScores: number[];
+    if (this.capabilityConfig.reranking.provider === "remote") {
+      const json = await this.remotePost(this.capabilityConfig.reranking, {
+        model: configuredModel,
+        query,
+        documents: texts,
+        top_n: texts.length,
+        return_documents: false,
+      });
+      flatScores = Array.from({ length: texts.length }, () => 0);
+      for (const item of (json?.results ?? [])) {
+        if (typeof item?.index !== "number") continue;
+        const score = typeof item?.relevance_score === "number"
+          ? item.relevance_score
+          : (typeof item?.score === "number" ? item.score : 0);
+        flatScores[item.index] = score;
+      }
+    } else {
+      const contexts = await this.ensureRerankContexts();
+      // Split documents across contexts for parallel evaluation.
+      // Each context has its own sequence with a lock, so parallelism comes
+      // from multiple contexts evaluating different chunks simultaneously.
+      const activeContextCount = Math.max(
+        1,
+        Math.min(
+          contexts.length,
+          Math.ceil(texts.length / LlamaCpp.RERANK_TARGET_DOCS_PER_CONTEXT)
+        )
+      );
+      const activeContexts = contexts.slice(0, activeContextCount);
+      const chunkSize = Math.ceil(texts.length / activeContexts.length);
+      const chunks = Array.from({ length: activeContexts.length }, (_, i) =>
+        texts.slice(i * chunkSize, (i + 1) * chunkSize)
+      ).filter(chunk => chunk.length > 0);
 
-    const allScores = await Promise.all(
-      chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
-    );
+      const allScores = await Promise.all(
+        chunks.map((chunk, i) => activeContexts[i]!.rankAll(query, chunk))
+      );
+      flatScores = allScores.flat();
+    }
 
-    // Reassemble scores in original order and sort
-    const flatScores = allScores.flat();
     const ranked = texts
       .map((text, i) => ({ document: text, score: flatScores[i]! }))
       .sort((a, b) => b.score - a.score);
@@ -1157,7 +1383,7 @@ export class LlamaCpp implements LLM {
 
     return {
       results,
-      model: this.rerankModelUri,
+      model: configuredModel,
     };
   }
 
@@ -1484,8 +1710,7 @@ let defaultLlamaCpp: LlamaCpp | null = null;
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
-    const embedModel = process.env.QMD_EMBED_MODEL;
-    defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
+    defaultLlamaCpp = new LlamaCpp({});
   }
   return defaultLlamaCpp;
 }

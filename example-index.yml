@@ -8,6 +8,44 @@
 # Use this for universal search instructions or patterns
 global_context: "If you see a relevant [[WikiWord]], you can search for that WikiWord to get more context."
 
+# Optional LLM provider config.
+# Omit this whole block to keep the default fully-managed local behavior.
+#
+# llm:
+#   embedding:
+#     provider: remote
+#     model: Qwen/Qwen3-Embedding-0.6B
+#     api_endpoint: https://your-endpoint/v1/embeddings
+#     api_key: ${EMBEDDING_API_KEY}
+#
+#   reranking:
+#     provider: remote
+#     model: Qwen/Qwen3-Reranker-0.6B
+#     api_endpoint: https://your-endpoint/v1/rerank
+#     api_key: ${RERANK_API_KEY}
+#
+#   expansion:
+#     provider: remote
+#     model: Qwen/Qwen3-Coder-30B-A3B-Instruct
+#     api_endpoint: https://your-endpoint/v1/chat/completions
+#     api_key: ${EXPANSION_API_KEY}
+#     enable_hyde: false
+#
+# Example local override using HuggingFace URIs:
+# llm:
+#   embedding:
+#     provider: local
+#     model: hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf
+#
+#   reranking:
+#     provider: local
+#     model: hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf
+#
+#   expansion:
+#     provider: local
+#     model: hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf
+#     enable_hyde: true
+
 # Collection definitions
 collections:
   # Meeting notes

@@ -100,6 +100,45 @@ describe("createStore", () => {
     await store.close();
   });
 
+  test("creates store with inline llm config", async () => {
+    const store = await createStore({
+      dbPath: freshDbPath(),
+      config: {
+        llm: {
+          embedding: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Embedding-0.6B",
+            api_endpoint: "https://example.com/v1/embeddings",
+            api_key: "sk-embed",
+          },
+          reranking: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Reranker-0.6B",
+            api_endpoint: "https://example.com/v1/rerank",
+            api_key: "sk-rerank",
+          },
+          expansion: {
+            provider: "remote",
+            model: "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            api_endpoint: "https://example.com/v1/chat/completions",
+            api_key: "sk-expand",
+            enable_hyde: false,
+          },
+        },
+        collections: {
+          docs: { path: docsDir, pattern: "**/*.md" },
+        },
+      },
+    });
+
+    expect(store.internal.llm?.getProviderInfo()).toMatchObject({
+      embedding: { provider: "remote", model: "Qwen/Qwen3-Embedding-0.6B" },
+      reranking: { provider: "remote", model: "Qwen/Qwen3-Reranker-0.6B" },
+      expansion: { provider: "remote", model: "Qwen/Qwen3-Coder-30B-A3B-Instruct", enableHyde: false },
+    });
+    await store.close();
+  });
+
   test("throws if dbPath is missing", async () => {
     await expect(
       createStore({ dbPath: "", config: { collections: {} } })

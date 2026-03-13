@@ -76,7 +76,7 @@ import {
   syncConfigToDb,
   type ReindexResult,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { LlamaCpp, disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -112,11 +112,23 @@ let storeDbPathOverride: string | undefined;
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
+    let loadedConfig;
+    try {
+      loadedConfig = loadConfig();
+    } catch {
+      loadedConfig = undefined;
+    }
     store = createStore(storeDbPathOverride);
     // Sync YAML config into SQLite store_collections so store.ts reads from DB
     try {
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
+      if (loadedConfig) {
+        syncConfigToDb(store.db, loadedConfig);
+        store.llm = new LlamaCpp({
+          llmConfig: loadedConfig.llm,
+          inactivityTimeoutMs: 5 * 60 * 1000,
+          disposeModelsOnInactivity: true,
+        });
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -303,6 +315,16 @@ function formatBytes(bytes: number): string {
 async function showStatus(): Promise<void> {
   const dbPath = getDbPath();
   const db = getDb();
+  let loadedConfig;
+  try {
+    loadedConfig = loadConfig();
+  } catch {
+    loadedConfig = undefined;
+  }
+  const useConfiguredLlm = !!loadedConfig?.llm;
+  const statusLlm = useConfiguredLlm
+    ? new LlamaCpp({ llmConfig: loadedConfig.llm })
+    : getDefaultLlamaCpp();
 
   // Collections are defined in YAML; no duplicate cleanup needed.
   // Collections are defined in YAML; no duplicate cleanup needed.
@@ -420,40 +442,59 @@ async function showStatus(): Promise<void> {
       const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
+    const providerInfo = statusLlm.getProviderInfo();
+    const renderCapability = (label: string, config: ReturnType<typeof statusLlm.getProviderInfo>["embedding"]) => {
+      if (config.provider === "remote") {
+        console.log(`  ${label}:   remote ${config.model}`);
+        console.log(`           ${c.dim}${config.apiEndpoint}${c.reset}`);
+        return;
+      }
+      console.log(`  ${label}:   local ${hfLink(config.model)}`);
+    };
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    renderCapability("Embedding", providerInfo.embedding);
+    renderCapability("Reranking", providerInfo.reranking);
+    renderCapability("Expansion", providerInfo.expansion);
   }
 
   // Device / GPU info
   try {
-    const llm = getDefaultLlamaCpp();
-    const device = await llm.getDeviceInfo();
+    const providerInfo = statusLlm.getProviderInfo();
+    const usesLocal = [providerInfo.embedding, providerInfo.reranking, providerInfo.expansion]
+      .some(cap => cap.provider === "local");
     console.log(`\n${c.bold}Device${c.reset}`);
-    if (device.gpu) {
-      console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-      if (device.gpuDevices.length > 0) {
-        // Deduplicate and count GPUs
-        const counts = new Map<string, number>();
-        for (const name of device.gpuDevices) {
-          counts.set(name, (counts.get(name) || 0) + 1);
-        }
-        const deviceStr = Array.from(counts.entries())
-          .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-          .join(', ');
-        console.log(`  Devices:  ${deviceStr}`);
-      }
-      if (device.vram) {
-        console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-      }
+    if (!usesLocal) {
+      console.log(`  Mode:     remote-only`);
     } else {
-      console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-      console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      const device = await statusLlm.getDeviceInfo();
+      if (device.gpu) {
+        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
+        if (device.gpuDevices.length > 0) {
+          // Deduplicate and count GPUs
+          const counts = new Map<string, number>();
+          for (const name of device.gpuDevices) {
+            counts.set(name, (counts.get(name) || 0) + 1);
+          }
+          const deviceStr = Array.from(counts.entries())
+            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
+            .join(', ');
+          console.log(`  Devices:  ${deviceStr}`);
+        }
+        if (device.vram) {
+          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
+        }
+      } else {
+        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
+        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
+      }
+      console.log(`  CPU:      ${device.cpuCores} math cores`);
     }
-    console.log(`  CPU:      ${device.cpuCores} math cores`);
   } catch {
     // Don't fail status if LLM init fails
+  }
+
+  if (useConfiguredLlm) {
+    await statusLlm.dispose();
   }
 
   // Tips section

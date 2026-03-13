@@ -33,11 +33,28 @@ export interface Collection {
   includeByDefault?: boolean; // Include in queries by default (default: true)
 }
 
+export type LLMProvider = "local" | "remote";
+
+export interface LLMCapabilityConfig {
+  provider?: LLMProvider;
+  model?: string;
+  api_endpoint?: string;
+  api_key?: string;
+  enable_hyde?: boolean;
+}
+
+export interface LLMConfig {
+  embedding?: LLMCapabilityConfig;
+  reranking?: LLMCapabilityConfig;
+  expansion?: LLMCapabilityConfig;
+}
+
 /**
  * The complete configuration file structure
  */
 export interface CollectionConfig {
   global_context?: string;                    // Context applied to all collections
+  llm?: LLMConfig;                            // Optional LLM provider configuration
   collections: Record<string, Collection>;    // Collection name -> config
 }
 

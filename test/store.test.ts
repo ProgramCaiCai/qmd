@@ -39,6 +39,7 @@ import {
   extractSnippet,
   getCacheKey,
   handelize,
+  structuredSearch,
   normalizeVirtualPath,
   isVirtualPath,
   parseVirtualPath,
@@ -568,9 +569,33 @@ describe("Embedding Formatting", () => {
     expect(formatted).toBe("task: search result | query: how to deploy");
   });
 
+  test("formatQueryForEmbedding ignores QMD_EMBED_MODEL env var without an explicit model", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    try {
+      const formatted = formatQueryForEmbedding("how to deploy");
+      expect(formatted).toBe("task: search result | query: how to deploy");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
+  });
+
   test("formatDocForEmbedding adds title and text prefix", () => {
     const formatted = formatDocForEmbedding("Some content", "My Title");
     expect(formatted).toBe("title: My Title | text: Some content");
+  });
+
+  test("formatDocForEmbedding ignores QMD_EMBED_MODEL env var without an explicit model", () => {
+    const prev = process.env.QMD_EMBED_MODEL;
+    process.env.QMD_EMBED_MODEL = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";
+    try {
+      const formatted = formatDocForEmbedding("Some content", "My Title");
+      expect(formatted).toBe("title: My Title | text: Some content");
+    } finally {
+      if (prev === undefined) delete process.env.QMD_EMBED_MODEL;
+      else process.env.QMD_EMBED_MODEL = prev;
+    }
   });
 
   test("formatDocForEmbedding handles missing title", () => {
@@ -716,6 +741,34 @@ describe.skipIf(!!process.env.CI)("Token-based Chunking", () => {
     expect(chunks[0]!.tokens).toBeGreaterThan(0);
     expect(chunks[0]!.tokens).toBeLessThan(content.length);  // Tokens < chars for English
   });
+
+  test("structuredSearch keeps long CJK rerank chunks below the token-sized character range", async () => {
+    const store = await createTestStore();
+    const collectionName = await createTestCollection();
+
+    const body = `# 龙虾记录\n\n${"龙虾".repeat(2600)}`;
+    await insertTestDocument(store.db, collectionName, {
+      name: "lobster-cjk",
+      title: "龙虾记录",
+      displayPath: "lobster-cjk.md",
+      body,
+    });
+
+    try {
+      const results = await structuredSearch(
+        store,
+        [{ type: "lex", query: "龙虾" }],
+        { skipRerank: true, limit: 10, minScore: 0 }
+      );
+
+      expect(results).toHaveLength(1);
+      // Char-based chunking produces ~3600-char chunks here.
+      // Token-aware chunking should keep CJK chunks much smaller.
+      expect(results[0]!.bestChunk.length).toBeLessThan(2000);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  }, 30000);
 });
 
 // =============================================================================

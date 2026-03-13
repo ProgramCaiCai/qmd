@@ -66,6 +66,21 @@ function getLlm(store: Store): LlamaCpp {
   return store.llm ?? getDefaultLlamaCpp();
 }
 
+function getEmbedModelForStore(store: Store): string {
+  const llm = getLlm(store) as LlamaCpp & { getEmbeddingModel?: () => string };
+  return llm.getEmbeddingModel?.() ?? DEFAULT_EMBED_MODEL;
+}
+
+function getRerankModelForStore(store: Store): string {
+  const llm = getLlm(store) as LlamaCpp & { getRerankModel?: () => string };
+  return llm.getRerankModel?.() ?? DEFAULT_RERANK_MODEL;
+}
+
+function getExpansionModelForStore(store: Store): string {
+  const llm = getLlm(store) as LlamaCpp & { getExpansionModel?: () => string };
+  return llm.getExpansionModel?.() ?? DEFAULT_QUERY_MODEL;
+}
+
 // =============================================================================
 // Smart Chunking - Break Point Detection
 // =============================================================================
@@ -1293,7 +1308,7 @@ export async function generateEmbeddings(
   options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
-  const model = options?.model ?? DEFAULT_EMBED_MODEL;
+  const model = options?.model ?? getEmbedModelForStore(store);
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
@@ -1333,7 +1348,7 @@ export async function generateEmbeddings(
         if (!doc.body.trim()) continue;
 
         const title = extractTitle(doc.body, doc.path);
-        const chunks = await chunkDocumentByTokens(doc.body);
+        const chunks = await chunkDocumentByTokens(doc.body, CHUNK_SIZE_TOKENS, CHUNK_OVERLAP_TOKENS, CHUNK_WINDOW_TOKENS, llm);
 
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
@@ -1358,7 +1373,7 @@ export async function generateEmbeddings(
 
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
-        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, model);
         const firstResult = await session.embed(firstText);
         if (!firstResult) {
           throw new Error("Failed to get embedding dimensions from first chunk");
@@ -1373,7 +1388,7 @@ export async function generateEmbeddings(
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
         const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
         const chunkBatch = batchChunks.slice(batchStart, batchEnd);
-        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, model));
 
         try {
           const embeddings = await session.embedBatch(texts);
@@ -1392,7 +1407,7 @@ export async function generateEmbeddings(
           // Batch failed — try individual embeddings as fallback
           for (const chunk of chunkBatch) {
             try {
-              const text = formatDocForEmbedding(chunk.text, chunk.title);
+              const text = formatDocForEmbedding(chunk.text, chunk.title, model);
               const result = await session.embed(text);
               if (result) {
                 insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
@@ -1486,10 +1501,10 @@ export function createStore(dbPath?: string): Store {
 
     // Search
     searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding, store.llm),
 
     // Query expansion & reranking
-    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model, db, intent, store.llm),
+    expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? getExpansionModelForStore(store), db, intent, store.llm),
     rerank: (query: string, documents: { file: string; text: string }[], model?: string, intent?: string) => rerank(query, documents, model, db, intent, store.llm),
 
     // Document retrieval
@@ -2072,9 +2087,10 @@ export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-  windowTokens: number = CHUNK_WINDOW_TOKENS
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  llmOverride?: LlamaCpp
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -2084,13 +2100,22 @@ export async function chunkDocumentByTokens(
   const windowChars = windowTokens * avgCharsPerToken;
 
   // Chunk in character space with conservative estimate
-  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  const charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+
+  const tokenizer = (llm as { tokenize?: (text: string) => Promise<readonly unknown[]> }).tokenize;
+  if (typeof tokenizer !== "function") {
+    return charChunks.map((chunk) => ({
+      text: chunk.text,
+      pos: chunk.pos,
+      tokens: Math.max(1, Math.ceil(chunk.text.length / avgCharsPerToken)),
+    }));
+  }
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
 
   for (const chunk of charChunks) {
-    const tokens = await llm.tokenize(chunk.text);
+    const tokens = await tokenizer.call(llm, chunk.text);
 
     if (tokens.length <= maxTokens) {
       results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
@@ -2103,7 +2128,7 @@ export async function chunkDocumentByTokens(
       const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
       for (const subChunk of subChunks) {
-        const subTokens = await llm.tokenize(subChunk.text);
+        const subTokens = await tokenizer.call(llm, subChunk.text);
         results.push({
           text: subChunk.text,
           pos: chunk.pos + subChunk.pos,
@@ -2114,6 +2139,40 @@ export async function chunkDocumentByTokens(
   }
 
   return results;
+}
+
+async function buildRerankChunkMap(
+  llm: LlamaCpp,
+  candidates: RankedResult[],
+  queryTerms: string[],
+  intentTerms: string[]
+): Promise<Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>> {
+  const entries = await Promise.all(candidates.map(async (cand) => {
+    const tokenChunks = await chunkDocumentByTokens(cand.body, CHUNK_SIZE_TOKENS, CHUNK_OVERLAP_TOKENS, CHUNK_WINDOW_TOKENS, llm);
+    if (tokenChunks.length === 0) return null;
+
+    const chunks = tokenChunks.map(({ text, pos }) => ({ text, pos }));
+
+    // Pick chunk with most keyword overlap (fallback: first chunk)
+    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
+    let bestIdx = 0;
+    let bestScore = -1;
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkLower = chunks[i]!.text.toLowerCase();
+      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
+      for (const term of intentTerms) {
+        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+
+    return [cand.file, { chunks, bestIdx }] as const;
+  }));
+
+  return new Map(entries.filter((entry): entry is readonly [string, { chunks: { text: string; pos: number }[]; bestIdx: number }] => entry !== null));
 }
 
 // =============================================================================
@@ -2797,11 +2856,11 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[], llmOverride?: LlamaCpp): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
-  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
+  const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llmOverride);
   if (!embedding) return [];
 
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
@@ -2945,9 +3004,11 @@ export function insertEmbedding(
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string | undefined, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const resolvedModel = model || llm.getExpansionModel();
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
+  const cacheKey = getCacheKey("expandQuery", { query, model: resolvedModel, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2963,8 +3024,6 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -2984,7 +3043,9 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string | undefined, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const resolvedModel = model || llm.getRerankModel();
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -2997,8 +3058,8 @@ export async function rerank(query: string, documents: { file: string; text: str
   // File path is excluded from the new cache key because the reranker score
   // depends on the chunk content, not where it came from.
   for (const doc of documents) {
-    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk: doc.text });
-    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model, chunk: doc.text });
+    const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: resolvedModel, chunk: doc.text });
+    const legacyCacheKey = getCacheKey("rerank", { query, file: doc.file, model: resolvedModel, chunk: doc.text });
     const cached = getCachedResult(db, cacheKey) ?? getCachedResult(db, legacyCacheKey);
     if (cached !== null) {
       cachedResults.set(doc.text, parseFloat(cached));
@@ -3009,15 +3070,14 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
-    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
+    const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model: resolvedModel });
 
     // Cache results by chunk text so identical chunks across files are scored once.
     const textByFile = new Map(uncachedDocs.map(d => [d.file, d.text]));
     for (const result of rerankResult.results) {
       const chunk = textByFile.get(result.file) || "";
-      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model, chunk });
+      const cacheKey = getCacheKey("rerank", { query: rerankQuery, model: resolvedModel, chunk });
       setCachedResult(db, cacheKey, result.score.toString());
       cachedResults.set(chunk, result.score);
     }
@@ -3764,6 +3824,8 @@ export async function hybridQuery(
     }
   }
 
+  const llm = getLlm(store);
+
   // 3b: Collect all texts that need vector search (original query + vec/hyde expansions)
   if (hasVectors) {
     const vecQueries: { text: string; queryType: "original" | "vec" | "hyde" }[] = [
@@ -3776,8 +3838,7 @@ export async function hybridQuery(
     }
 
     // Batch embed all vector queries in a single call
-    const llm = getLlm(store);
-    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text));
+    const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, getEmbedModelForStore(store)));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
     const embeddings = await llm.embedBatch(textsToEmbed);
@@ -3789,7 +3850,7 @@ export async function hybridQuery(
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, DEFAULT_EMBED_MODEL, 20, collection,
+        vecQueries[i]!.text, getEmbedModelForStore(store), 20, collection,
         undefined, embedding
       );
       if (vecResults.length > 0) {
@@ -3819,27 +3880,7 @@ export async function hybridQuery(
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-
-  for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
-    if (chunks.length === 0) continue;
-
-    // Pick chunk with most keyword overlap (fallback: first chunk)
-    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
-
-    docChunkMap.set(cand.file, { chunks, bestIdx });
-  }
+  const docChunkMap = await buildRerankChunkMap(llm, candidates, queryTerms, intentTerms);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
@@ -3902,7 +3943,7 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, getRerankModelForStore(store), intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -4021,7 +4062,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, DEFAULT_EMBED_MODEL, limit, collection);
+    const vecResults = await store.searchVec(q, getEmbedModelForStore(store), limit, collection);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -4151,14 +4192,14 @@ export async function structuredSearch(
   }
 
   // Step 2: Batch embed and run vector searches for vec/hyde
+  const llm = getLlm(store);
   if (hasVectors) {
     const vecSearches = searches.filter(
       (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
         s.type === 'vec' || s.type === 'hyde'
     );
     if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query));
+      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, getEmbedModelForStore(store)));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
       const embeddings = await llm.embedBatch(textsToEmbed);
@@ -4170,7 +4211,7 @@ export async function structuredSearch(
 
         for (const coll of collectionList) {
           const vecResults = await store.searchVec(
-            vecSearches[i]!.query, DEFAULT_EMBED_MODEL, 20, coll,
+            vecSearches[i]!.query, getEmbedModelForStore(store), 20, coll,
             undefined, embedding
           );
           if (vecResults.length > 0) {
@@ -4209,27 +4250,7 @@ export async function structuredSearch(
     || searches[0]?.query || "";
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
-
-  for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
-    if (chunks.length === 0) continue;
-
-    // Pick chunk with most keyword overlap
-    // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
-      let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
-      for (const term of intentTerms) {
-        if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
-      }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
-
-    docChunkMap.set(cand.file, { chunks, bestIdx });
-  }
+  const docChunkMap = await buildRerankChunkMap(llm, candidates, queryTerms, intentTerms);
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
@@ -4292,7 +4313,7 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, getRerankModelForStore(store), intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
