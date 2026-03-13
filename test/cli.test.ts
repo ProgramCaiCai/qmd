@@ -253,6 +253,37 @@ describe("CLI Embed", () => {
     expect(exitCode).toBe(1);
     expect(stderr).toContain("maxBatchBytes");
   });
+
+  test("embed shows configured embedding model from YAML at startup", async () => {
+    const env = await createIsolatedTestEnv("embed-llm");
+    const emptyDir = join(testDir, `embed-empty-${Date.now()}`);
+    await mkdir(emptyDir, { recursive: true });
+
+    await writeFile(
+      join(env.configDir, "index.yml"),
+      [
+        "llm:",
+        "  embedding:",
+        "    provider: remote",
+        "    model: Qwen/Qwen3-Embedding-0.6B",
+        "    api_endpoint: https://example.com/v1/embeddings",
+        "    api_key: sk-embed",
+        "collections:",
+        "  empty:",
+        `    path: ${emptyDir}`,
+        "    pattern: '**/*.md'",
+        "",
+      ].join("\n")
+    );
+
+    const { stdout, exitCode } = await runQmd(["embed", "-f"], {
+      dbPath: env.dbPath,
+      configDir: env.configDir,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("Model: Qwen/Qwen3-Embedding-0.6B");
+  });
 });
 
 describe("CLI Skill Commands", () => {

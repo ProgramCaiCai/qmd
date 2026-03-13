@@ -66,7 +66,6 @@ import {
   DEFAULT_EMBED_MODEL,
   DEFAULT_EMBED_MAX_BATCH_BYTES,
   DEFAULT_EMBED_MAX_DOCS_PER_BATCH,
-  DEFAULT_RERANK_MODEL,
   DEFAULT_GLOB,
   DEFAULT_MULTI_GET_MAX_BYTES,
   createStore,
@@ -162,6 +161,10 @@ function closeDb(): void {
 
 function getDbPath(): string {
   return store?.dbPath ?? storeDbPathOverride ?? getDefaultDbPath();
+}
+
+function getConfiguredEmbeddingModel(storeInstance: ReturnType<typeof createStore>): string {
+  return storeInstance.llm?.getEmbeddingModel?.() ?? DEFAULT_EMBED_MODEL;
 }
 
 function setIndexName(name: string | null): void {
@@ -1659,12 +1662,13 @@ function parseEmbedBatchOption(name: string, value: unknown): number | undefined
 }
 
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL,
+  model: string | undefined = undefined,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  const resolvedModel = model ?? getConfiguredEmbeddingModel(storeInstance);
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -1678,7 +1682,7 @@ async function vectorIndex(
     return;
   }
 
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  console.log(`${c.dim}Model: ${resolvedModel}${c.reset}\n`);
   if (batchOptions?.maxDocsPerBatch !== undefined || batchOptions?.maxBatchBytes !== undefined) {
     const maxDocsPerBatch = batchOptions.maxDocsPerBatch ?? DEFAULT_EMBED_MAX_DOCS_PER_BATCH;
     const maxBatchBytes = batchOptions.maxBatchBytes ?? DEFAULT_EMBED_MAX_BATCH_BYTES;
@@ -1691,7 +1695,7 @@ async function vectorIndex(
 
   const result = await generateEmbeddings(storeInstance, {
     force,
-    model,
+    model: resolvedModel,
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     onProgress: (info) => {
@@ -2177,7 +2181,7 @@ function logExpansionTree(originalQuery: string, expanded: ExpandedQuery[]): voi
   for (const line of lines) process.stderr.write(line + '\n');
 }
 
-async function vectorSearch(query: string, opts: OutputOptions, _model: string = DEFAULT_EMBED_MODEL): Promise<void> {
+async function vectorSearch(query: string, opts: OutputOptions): Promise<void> {
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2228,7 +2232,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
   }, { maxDuration: 10 * 60 * 1000, name: 'vectorSearch' });
 }
 
-async function querySearch(query: string, opts: OutputOptions, _embedModel: string = DEFAULT_EMBED_MODEL, _rerankModel: string = DEFAULT_RERANK_MODEL): Promise<void> {
+async function querySearch(query: string, opts: OutputOptions): Promise<void> {
   const store = getStore();
 
   // Validate collection filter (supports multiple -c flags)
@@ -2992,7 +2996,7 @@ if (isMain) {
       try {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL, !!cli.values.force, {
+        await vectorIndex(undefined, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
         });
@@ -3004,12 +3008,24 @@ if (isMain) {
 
     case "pull": {
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
-      ];
+      const storeInstance = getStore();
+      const providerInfo = storeInstance.llm?.getProviderInfo();
+      const models = providerInfo
+        ? [
+            providerInfo.embedding.provider === "local" ? providerInfo.embedding.model : null,
+            providerInfo.expansion.provider === "local" ? providerInfo.expansion.model : null,
+            providerInfo.reranking.provider === "local" ? providerInfo.reranking.model : null,
+          ].filter((model): model is string => model !== null)
+        : [
+            DEFAULT_EMBED_MODEL_URI,
+            DEFAULT_GENERATE_MODEL_URI,
+            DEFAULT_RERANK_MODEL_URI,
+          ];
       console.log(`${c.bold}Pulling models${c.reset}`);
+      if (models.length === 0) {
+        console.log(`${c.dim}No local models configured to pull.${c.reset}`);
+        break;
+      }
       const results = await pullModels(models, {
         refresh,
         cacheDir: DEFAULT_MODEL_CACHE_DIR,

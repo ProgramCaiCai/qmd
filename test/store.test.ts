@@ -39,6 +39,7 @@ import {
   extractSnippet,
   getCacheKey,
   handelize,
+  searchVec,
   structuredSearch,
   normalizeVirtualPath,
   isVirtualPath,
@@ -2440,6 +2441,27 @@ describe.skipIf(!!process.env.CI)("LlamaCpp Integration", () => {
     expect(results.length).toBeGreaterThan(0);
 
     await cleanupTestDb(store);
+  });
+
+  test("searchVec returns empty results when vectors_vec exists but vec0 module is unavailable", async () => {
+    const fakeDb = {
+      prepare(sql: string) {
+        if (sql.includes("sqlite_master") && sql.includes("vectors_vec")) {
+          return { get: () => ({ name: "vectors_vec" }) };
+        }
+        if (sql.includes("FROM vectors_vec")) {
+          return {
+            all: () => {
+              throw new Error("SQLiteError: no such module: vec0");
+            },
+          };
+        }
+        throw new Error(`Unexpected SQL in test: ${sql}`);
+      },
+    } as unknown as Database;
+
+    const results = await searchVec(fakeDb, "test content", "embeddinggemma", 5, undefined, undefined, [0.1, 0.2]);
+    expect(results).toEqual([]);
   });
 
   test("expandQuery returns typed expansions (no original query)", async () => {

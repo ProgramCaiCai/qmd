@@ -628,6 +628,11 @@ function getErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function isMissingSqliteVecModuleError(err: unknown): boolean {
+  const message = getErrorMessage(err).toLowerCase();
+  return message.includes("no such module: vec0");
+}
+
 export function verifySqliteVecLoaded(db: Database): void {
   try {
     const row = db.prepare(`SELECT vec_version() AS version`).get() as { version?: string } | null;
@@ -2869,11 +2874,17 @@ export async function searchVec(db: Database, query: string, model: string, limi
   // See: https://github.com/tobi/qmd/pull/23
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
-  const vecResults = db.prepare(`
-    SELECT hash_seq, distance
-    FROM vectors_vec
-    WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  let vecResults: { hash_seq: string; distance: number }[];
+  try {
+    vecResults = db.prepare(`
+      SELECT hash_seq, distance
+      FROM vectors_vec
+      WHERE embedding MATCH ? AND k = ?
+    `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  } catch (err) {
+    if (isMissingSqliteVecModuleError(err)) return [];
+    throw err;
+  }
 
   if (vecResults.length === 0) return [];
 
